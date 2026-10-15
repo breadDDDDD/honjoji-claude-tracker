@@ -339,30 +339,67 @@ func (a *app) modelsPanel(accent rgb) []string {
 // ---- diffing screen writer ------------------------------------------------
 
 type screen struct {
-	prev []string
-	w, h int
+	prev   []string
+	w, h   int
+	synced time.Time
 }
 
-// draw rewrites only the rows that changed since the last frame.
+// repaintEvery bounds how long the screen can stay out of step with prev.
+// Anything that scrolls the terminal behind our back (ConPTY reflow, another
+// process writing to the console) leaves unchanged rows shifted, which the
+// diff alone would never fix: you'd see duplicated rows until a resize.
+const repaintEvery = 2 * time.Second
+
+// clip cuts s to at most w printed columns, keeping escape sequences intact.
+func clip(s string, w int) string {
+	n := 0
+	for i := 0; i < len(s); {
+		if s[i] == 0x1b {
+			j := i + 1
+			for ; j < len(s) && !(s[j] >= '@' && s[j] <= '~' && s[j] != '['); j++ {
+			}
+			i = j + 1
+			continue
+		}
+		if n == w {
+			return s[:i]
+		}
+		_, sz := utf8.DecodeRuneInString(s[i:])
+		i += sz
+		n++
+	}
+	return s
+}
+
+// draw rewrites only the rows that changed since the last frame, plus every
+// row each repaintEvery to undo any scrolling it didn't cause.
 func (s *screen) draw(out *bufio.Writer, lines []string, w, h int) {
 	full := w != s.w || h != s.h
 	if full {
 		out.WriteString("\x1b[2J")
 		s.prev, s.w, s.h = nil, w, h
 	}
+	if now := time.Now(); now.Sub(s.synced) >= repaintEvery {
+		full, s.synced = true, now
+	}
 	for i := 0; i < h; i++ {
 		line := ""
 		if i < len(lines) {
-			line = lines[i]
+			// Stop one column short of the edge: a row that fills or overflows
+			// the width wraps (or parks the cursor in pending-wrap, which some
+			// terminals scroll on), and on the last row that scrolls the screen.
+			line = clip(lines[i], w-1)
 		}
 		if !full && i < len(s.prev) && s.prev[i] == line {
 			continue
 		}
 		fmt.Fprintf(out, "\x1b[%d;1H%s\x1b[0m\x1b[K", i+1, line)
+		if i < len(s.prev) {
+			s.prev[i] = line
+		} else {
+			s.prev = append(s.prev, line)
+		}
 	}
-	s.prev = append(s.prev[:0], lines...)
-	if len(s.prev) > h {
-		s.prev = s.prev[:h]
-	}
+	s.prev = s.prev[:min(len(s.prev), h)]
 	out.Flush()
 }
